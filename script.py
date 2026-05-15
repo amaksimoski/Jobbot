@@ -11,7 +11,7 @@ import os
 import json
 import re
 import html
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -29,7 +29,7 @@ STATE_FILE = "state.json"
 MATCH_THRESHOLD = 8
 MAX_JOBS_PER_QUERY = 10
 MAX_NEW_JOBS_TO_PROCESS = 12
-DASHBOARD_HISTORY_DAYS = 7
+ROLLING_WINDOW_DAYS = 14   # how long a job stays on the dashboard after first seen
 
 SEARCHES = [
     {"query": "network engineer in Toronto, Canada", "remote_only": False},
@@ -58,15 +58,43 @@ client = Anthropic(api_key=ANTHROPIC_API_KEY)
 # ─────────────────────────────────────────────────────────────
 
 def load_state():
+    """State schema:
+    {
+      "active_jobs": { "job_id": {full job dict with score, reason, first_seen}, ... },
+      "daily_counts": [ {"date": "YYYY-MM-DD", "new": N, "high": N, "mid": N}, ... ],
+      "last_run": "ISO timestamp"
+    }
+    """
     if Path(STATE_FILE).exists():
         with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"seen_ids": [], "history": [], "last_run": None}
+            data = json.load(f)
+        # Migrate old schema if needed (seen_ids -> active_jobs)
+        if "active_jobs" not in data:
+            data["active_jobs"] = {}
+        if "daily_counts" not in data:
+            data["daily_counts"] = []
+        return data
+    return {"active_jobs": {}, "daily_counts": [], "last_run": None}
 
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def prune_old_jobs(active_jobs, now):
+    """Remove jobs older than ROLLING_WINDOW_DAYS."""
+    cutoff = now - timedelta(days=ROLLING_WINDOW_DAYS)
+    kept = {}
+    for jid, job in active_jobs.items():
+        try:
+            first_seen = datetime.fromisoformat(job["first_seen"])
+            if first_seen >= cutoff:
+                kept[jid] = job
+        except (KeyError, ValueError):
+            # Malformed entry, drop it
+            pass
+    return kept
 
 
 # ─────────────────────────────────────────────────────────────
@@ -173,53 +201,103 @@ Scoring guidance:
 # HTML dashboard
 # ─────────────────────────────────────────────────────────────
 
-def build_dashboard(today_scored, history, generated_at):
+def build_dashboard(active_jobs, daily_counts, generated_at, today_new_ids):
+    """active_jobs: dict of job_id -> full job dict (incl. score, reason, first_seen)
+    daily_counts: list of {date, new, high, mid}
+    today_new_ids: set of job IDs first seen on this run
+    """
     today_str = generated_at.strftime("%A, %B %d, %Y")
-    high = [j for j in today_scored if j["score"] >= MATCH_THRESHOLD]
-    mid = [j for j in today_scored if 5 <= j["score"] < MATCH_THRESHOLD]
+    today_date = generated_at.strftime("%Y-%m-%d")
+
+    # Sort all active jobs by score desc, then by first_seen desc (newest first within tier)
+    all_jobs = sorted(
+        active_jobs.values(),
+        key=lambda j: (-int(j.get("score", 0)), j.get("first_seen", "")),
+    )
+
+    # Split into today vs earlier, but only within the visible tiers (>=5)
+    visible = [j for j in all_jobs if j.get("score", 0) >= 5]
+    today_jobs = [j for j in visible if j["id"] in today_new_ids]
+    earlier_jobs = [j for j in visible if j["id"] not in today_new_ids]
+
+    high_today = [j for j in today_jobs if j["score"] >= MATCH_THRESHOLD]
+    mid_today = [j for j in today_jobs if 5 <= j["score"] < MATCH_THRESHOLD]
+    high_earlier = [j for j in earlier_jobs if j["score"] >= MATCH_THRESHOLD]
+    mid_earlier = [j for j in earlier_jobs if 5 <= j["score"] < MATCH_THRESHOLD]
+
+    def days_ago(iso_str):
+        try:
+            seen = datetime.fromisoformat(iso_str)
+            delta = (generated_at - seen).days
+            if delta == 0:
+                return "today"
+            if delta == 1:
+                return "1 day ago"
+            return f"{delta} days ago"
+        except Exception:
+            return ""
 
     def card(j):
         score = j["score"]
         tier = "high" if score >= 8 else ("mid" if score >= 5 else "low")
         remote_badge = '<span class="badge-remote">remote</span>' if j.get("is_remote") else ""
+        new_badge = '<span class="badge-new">new</span>' if j["id"] in today_new_ids else ""
         city = html.escape(j.get("city", "").title() or "—")
         reason = html.escape(j.get("reason", ""))
+        age = days_ago(j.get("first_seen", ""))
+        age_html = f'<span class="age">{age}</span>' if age else ""
         return f"""
         <article class="card card-{tier}">
             <div class="card-head">
                 <div class="score score-{tier}">{score}<span>/10</span></div>
                 <div class="card-meta">
-                    <div class="company">{html.escape(j['company'])}</div>
+                    <div class="company">{html.escape(j['company'])}{new_badge}</div>
                     <div class="location">{city}{remote_badge}</div>
                 </div>
             </div>
             <h3 class="title"><a href="{html.escape(j['apply_link'])}" target="_blank" rel="noopener">{html.escape(j['title'])}</a></h3>
             <p class="reason">{reason}</p>
-            <a class="apply" href="{html.escape(j['apply_link'])}" target="_blank" rel="noopener">Apply →</a>
+            <div class="card-foot">
+                <a class="apply" href="{html.escape(j['apply_link'])}" target="_blank" rel="noopener">Apply →</a>
+                {age_html}
+            </div>
         </article>"""
 
-    def section(title, jobs, empty_msg):
+    def section(title, jobs, empty_msg=None):
         if not jobs:
-            return f'<section class="section"><h2>{title}</h2><p class="empty">{empty_msg}</p></section>'
+            if empty_msg:
+                return f'<section class="section"><h2>{title}</h2><p class="empty">{empty_msg}</p></section>'
+            return ""
         cards_html = "\n".join(card(j) for j in jobs)
         return f'<section class="section"><h2>{title} <span class="count">{len(jobs)}</span></h2><div class="cards">{cards_html}</div></section>'
 
+    # Daily history rail (last 14 days of counts)
     history_html = ""
-    if history:
+    if daily_counts:
         items = []
-        for day in history[-DASHBOARD_HISTORY_DAYS:][::-1]:
-            jobs = day.get("jobs", [])
-            high_n = sum(1 for j in jobs if j["score"] >= MATCH_THRESHOLD)
-            mid_n = sum(1 for j in jobs if 5 <= j["score"] < MATCH_THRESHOLD)
+        for day in daily_counts[-ROLLING_WINDOW_DAYS:][::-1]:
             items.append(
                 f'<li><span class="hist-date">{html.escape(day["date"])}</span>'
-                f'<span class="hist-stats">{high_n} high · {mid_n} mid · {len(jobs)} total</span></li>'
+                f'<span class="hist-stats">{day.get("high", 0)} high · {day.get("mid", 0)} mid · {day.get("new", 0)} new</span></li>'
             )
         history_html = f"""
         <section class="section history">
-            <h2>Last 7 days</h2>
+            <h2>Daily activity</h2>
             <ul class="history-list">{"".join(items)}</ul>
         </section>"""
+
+    # Build sections in order
+    sections_html = ""
+    if today_jobs:
+        sections_html += section(f"New today — high match", high_today)
+        sections_html += section(f"New today — worth a look", mid_today)
+    else:
+        sections_html += '<section class="section"><h2>New today</h2><p class="empty">No new matches today. Earlier jobs below.</p></section>'
+
+    if high_earlier:
+        sections_html += section(f"Still open — high match", high_earlier)
+    if mid_earlier:
+        sections_html += section(f"Still open — worth a look", mid_earlier)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -369,6 +447,19 @@ h1 em {{ font-style: italic; color: var(--accent); font-weight: 400; }}
     background: rgba(184,101,74,0.1);
     color: var(--accent);
 }}
+.badge-new {{
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 2px 6px;
+    margin-left: 6px;
+    border-radius: 2px;
+    background: var(--high);
+    color: white;
+    vertical-align: 1px;
+}}
 .title {{
     font-family: 'Fraunces', serif;
     font-weight: 500;
@@ -384,6 +475,19 @@ h1 em {{ font-style: italic; color: var(--accent); font-weight: 400; }}
     color: var(--text-dim);
     margin-bottom: 16px;
     line-height: 1.5;
+}}
+.card-foot {{
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+}}
+.age {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-faint);
 }}
 .apply {{
     display: inline-block;
@@ -447,20 +551,20 @@ footer {{
     <header>
         <div class="eyebrow">Daily brief</div>
         <h1>Job <em>hunt</em></h1>
-        <p class="subtitle">{today_str}</p>
+        <p class="subtitle">{today_str} · showing last {ROLLING_WINDOW_DAYS} days</p>
         <div class="stats">
-            <span><strong>{len(high)}</strong> high match</span>
-            <span><strong>{len(mid)}</strong> worth a look</span>
-            <span><strong>{len(today_scored)}</strong> new scored</span>
+            <span><strong>{len(today_jobs)}</strong> new today</span>
+            <span><strong>{len(high_today) + len(high_earlier)}</strong> high match open</span>
+            <span><strong>{len(mid_today) + len(mid_earlier)}</strong> worth a look</span>
+            <span><strong>{len(visible)}</strong> total active</span>
         </div>
     </header>
 
-    {section("High match", high, "No high matches today.")}
-    {section("Worth a look", mid, "No mid matches today.")}
+    {sections_html}
     {history_html}
 
     <footer>
-        Generated {generated_at.strftime('%Y-%m-%d %H:%M UTC')} · Data: JSearch (Indeed + LinkedIn + Glassdoor)
+        Generated {generated_at.strftime('%Y-%m-%d %H:%M UTC')} · Data: JSearch (Indeed + LinkedIn + Glassdoor) · Window: {ROLLING_WINDOW_DAYS} days
     </footer>
 </div>
 </body>
@@ -484,16 +588,16 @@ def send_telegram(text):
         r.raise_for_status()
 
 
-def format_digest(scored_jobs):
+def format_digest(new_today, high_today, mid_today, total_active):
     today = datetime.now().strftime("%a %b %d")
-    high = [j for j in scored_jobs if j["score"] >= MATCH_THRESHOLD]
-    mid = [j for j in scored_jobs if 5 <= j["score"] < MATCH_THRESHOLD]
-
     lines = [f"<b>🎯 Job Hunt — {today}</b>", ""]
-    if high or mid:
-        lines.append(f"🔥 {len(high)} high match · 👀 {len(mid)} worth a look")
+    if new_today > 0:
+        lines.append(f"🔥 {high_today} new high match · 👀 {mid_today} new worth a look")
     else:
-        lines.append("Nothing matched today.")
+        lines.append("No new matches today.")
+
+    if total_active > 0:
+        lines.append(f"📋 {total_active} jobs still open on the board")
 
     if SITE_URL:
         lines.append("")
@@ -510,18 +614,25 @@ def main():
     now = datetime.now(timezone.utc)
     print(f"Run: {now.isoformat()}")
     state = load_state()
-    seen = set(state["seen_ids"])
+
+    # Prune old jobs first (anything beyond 14 days drops out)
+    active_jobs = prune_old_jobs(state.get("active_jobs", {}), now)
+    pruned_count = len(state.get("active_jobs", {})) - len(active_jobs)
+    if pruned_count:
+        print(f"  Pruned {pruned_count} job(s) older than {ROLLING_WINDOW_DAYS} days")
+
+    seen_ids = set(active_jobs.keys())
 
     # 1. Fetch
-    all_jobs = []
+    all_fetched = []
     for s in SEARCHES:
         print(f"  Fetching: {s['query']} (remote={s['remote_only']})")
-        all_jobs.extend(fetch_jobs(s["query"], s["remote_only"]))
+        all_fetched.extend(fetch_jobs(s["query"], s["remote_only"]))
 
-    # 2. Dedupe + filter
+    # 2. Dedupe + filter (skip jobs we've already shown in the active window)
     by_id = {}
-    for j in all_jobs:
-        if not j["id"] or j["id"] in seen:
+    for j in all_fetched:
+        if not j["id"] or j["id"] in seen_ids:
             continue
         if not passes_location_filter(j):
             continue
@@ -530,45 +641,59 @@ def main():
     new_jobs = list(by_id.values())[:MAX_NEW_JOBS_TO_PROCESS]
     print(f"  {len(new_jobs)} new jobs after dedupe + filters")
 
-    scored = []
+    today_new_ids = set()
+    high_today_count = 0
+    mid_today_count = 0
+
     if new_jobs:
-        # 3. Score
+        # 3. Score and add to active_jobs
         for j in new_jobs:
             print(f"  Scoring: {j['title']} @ {j['company']}")
             score, reason = score_job(j)
-            scored.append({**j, "score": score, "reason": reason})
+            job_record = {
+                **j,
+                "score": score,
+                "reason": reason,
+                "first_seen": now.isoformat(),
+            }
+            active_jobs[j["id"]] = job_record
+            today_new_ids.add(j["id"])
+            if score >= MATCH_THRESHOLD:
+                high_today_count += 1
+            elif score >= 5:
+                mid_today_count += 1
 
-        scored.sort(key=lambda x: -x["score"])
-
-    # 4. Update history
-    history = state.get("history", [])
+    # 4. Update daily counts
+    daily_counts = state.get("daily_counts", [])
     today_key = now.strftime("%Y-%m-%d")
-    history = [h for h in history if h.get("date") != today_key]
-    history.append({
+    daily_counts = [d for d in daily_counts if d.get("date") != today_key]
+    daily_counts.append({
         "date": today_key,
-        "jobs": [
-            {"score": j["score"], "title": j["title"], "company": j["company"]}
-            for j in scored
-        ],
+        "new": len(today_new_ids),
+        "high": high_today_count,
+        "mid": mid_today_count,
     })
-    history = history[-DASHBOARD_HISTORY_DAYS:]
+    daily_counts = daily_counts[-ROLLING_WINDOW_DAYS:]
 
-    # 5. Build dashboard
+    # 5. Build dashboard from full active_jobs window
     os.makedirs("site", exist_ok=True)
-    html_doc = build_dashboard(scored, history[:-1] if history else [], now)
+    html_doc = build_dashboard(active_jobs, daily_counts, now, today_new_ids)
     with open("site/index.html", "w", encoding="utf-8") as f:
         f.write(html_doc)
-    print("  Dashboard written to site/index.html")
+    print(f"  Dashboard written: {len(active_jobs)} active jobs in window")
 
     # 6. Telegram
-    digest = format_digest(scored)
+    digest = format_digest(
+        new_today=len(today_new_ids),
+        high_today=high_today_count,
+        mid_today=mid_today_count,
+        total_active=len([j for j in active_jobs.values() if j.get("score", 0) >= 5]),
+    )
     send_telegram(digest)
 
     # 7. Save state
-    for j in scored:
-        seen.add(j["id"])
-    state["seen_ids"] = list(seen)[-1000:]
-    state["history"] = history
+    state["active_jobs"] = active_jobs
+    state["daily_counts"] = daily_counts
     state["last_run"] = now.isoformat()
     save_state(state)
     print("Done.")

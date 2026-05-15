@@ -1,0 +1,67 @@
+name: Job Hunter
+
+on:
+  schedule:
+    # 11:00 UTC = 7 AM EDT (Mar-Nov). EST winter shifts to 6 AM local.
+    # Weekdays only to stay under JSearch free tier (200/mo).
+    - cron: '0 11 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run job hunter
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          PHONE: ${{ secrets.PHONE }}
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: python script.py
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+      - name: Commit state.json
+        run: |
+          git config user.name "Job Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json || true
+          git diff --staged --quiet || git commit -m "Update job state [skip ci]"
+          git push || true
+
+  deploy-pages:
+    needs: build-and-send
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
